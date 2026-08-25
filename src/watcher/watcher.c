@@ -827,20 +827,22 @@ static void state_free(project_state_t *s) {
     free(s);
 }
 
-/* Stop and detach a state's fsevents watch. MUST be called with projects_lock
- * NOT held: cbm_fsevents_stop joins the fsevents thread, which itself calls
- * cbm_watcher_touch (acquires projects_lock) — joining it while already
- * holding that lock would deadlock. Safe to call once a state is no longer
- * reachable from w->projects (post-unwatch/replace/prune), since a concurrent
- * cbm_watcher_touch on the same project_name simply finds nothing and no-ops.
- * Idempotent: s->fsevents is NULL-safe and cleared after stopping. */
-static void state_stop_fsevents(project_state_t *s) {
-    if (!s || !s->fsevents) {
-        return;
+/* Detach a state's fsevents handle. MUST be called WHILE projects_lock is
+ * held, before the state is placed on pending_free — once a state is queued
+ * for deferred free, a concurrent cbm_watcher_poll_once can drain and free it
+ * (via state_free) the instant the lock is released, so touching s afterward
+ * (including just to read/clear s->fsevents) is a use-after-free. Returns the
+ * detached handle (or NULL) for the caller to stop with cbm_fsevents_stop
+ * AFTER releasing the lock — cbm_fsevents_stop joins the fsevents thread,
+ * which itself calls cbm_watcher_touch (acquires projects_lock), so joining
+ * it while still holding that lock would deadlock. */
+static cbm_fsevents_t *state_detach_fsevents(project_state_t *s) {
+    if (!s) {
+        return NULL;
     }
     cbm_fsevents_t *fe = s->fsevents;
     s->fsevents = NULL;
-    cbm_fsevents_stop(fe);
+    return fe;
 }
 
 /* Move a state onto the deferred-free list (caller holds projects_lock).
@@ -988,9 +990,9 @@ static void free_state_entry(const char *key, void *val, void *ud) {
 }
 
 /* Growable collector used only by cbm_watcher_free to detach every fsevents
- * handle from its state WHILE projects_lock is held (state_stop_fsevents
- * itself must never be called under that lock — it joins the fsevents
- * thread, which acquires projects_lock via cbm_watcher_touch). */
+ * handle from its state WHILE projects_lock is held (cbm_fsevents_stop itself
+ * must never be called under that lock — it joins the fsevents thread, which
+ * acquires projects_lock via cbm_watcher_touch). */
 typedef struct {
     cbm_fsevents_t **items;
     int count;
@@ -1112,10 +1114,16 @@ bool cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *r
         cbm_log_warn("watcher.watch.oom", "project", project_name, "path", root_path);
         return false;
     }
+    /* Started before the state is published anywhere, and stored into s only
+     * while projects_lock is held below — never touch s (including s->fsevents)
+     * after releasing the lock, since a concurrent poll_once can free it the
+     * instant it is reachable from pending_free (see state_detach_fsevents). */
+    cbm_fsevents_t *new_fe = cbm_fsevents_start(w, project_name, root_path);
 
     cbm_mutex_lock(&w->projects_lock);
     if (atomic_load_explicit(&w->stopped, memory_order_acquire)) {
         cbm_mutex_unlock(&w->projects_lock);
+        cbm_fsevents_stop(new_fe);
         state_free(s);
         return false;
     }
@@ -1125,18 +1133,22 @@ bool cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *r
          * project/root. Re-registering that identical watch must not discard
          * its git baseline, pending dirty signature, or immediate-touch state. */
         cbm_mutex_unlock(&w->projects_lock);
+        cbm_fsevents_stop(new_fe);
         state_free(s);
         return true;
     }
+    cbm_fsevents_t *old_fe = NULL;
     if (old) {
         /* A poll snapshot may still be using the old state, including while
          * its index callback calls back into this function. Queue it before
          * removing the table entry; on OOM, preserve the existing watch. */
         if (!defer_state_free(w, old)) {
             cbm_mutex_unlock(&w->projects_lock);
+            cbm_fsevents_stop(new_fe);
             state_free(s);
             return false;
         }
+        old_fe = state_detach_fsevents(old);
         cbm_ht_delete(w->projects, project_name);
     }
     cbm_ht_set(w->projects, s->project_name, s);
@@ -1147,6 +1159,8 @@ bool cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *r
         cbm_ht_set(w->projects, old->project_name, old);
         if (cbm_ht_get(w->projects, project_name) == old) {
             w->pending_free[--w->pending_free_count] = NULL;
+            old->fsevents = old_fe; /* restore: rollback undid the defer_state_free */
+            old_fe = NULL;
         } else {
             atomic_store_explicit(&old->registered, false, memory_order_release);
             if (old->active_git) {
@@ -1160,22 +1174,22 @@ bool cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *r
             (void)cbm_subprocess_request_cancel(old->active_git);
         }
     }
-    cbm_mutex_unlock(&w->projects_lock);
-    if (registered && old) {
-        /* Lock already released above — see state_stop_fsevents for why
-         * this must happen outside it. */
-        state_stop_fsevents(old);
+    /* Wake-up trigger only — never a substitute for the poll path. Stored
+     * while still under the lock so s is never mutated after publication
+     * becomes visible to a concurrent free. NULL is a normal, silent
+     * fallback to interval-only polling (see fsevents.h). */
+    if (registered) {
+        s->fsevents = new_fe;
+        new_fe = NULL;
     }
+    cbm_mutex_unlock(&w->projects_lock);
+    cbm_fsevents_stop(old_fe);
     if (!registered) {
+        cbm_fsevents_stop(new_fe);
         state_free(s);
         cbm_log_warn("watcher.watch.failed", "project", project_name, "reason", "registration");
         return false;
     }
-    /* Wake-up trigger only — never a substitute for the poll path. Started
-     * after registration so a fresh state is unreachable from cbm_watcher_touch
-     * (via the hash table) until it can actually be found there. NULL is a
-     * normal, silent fallback to interval-only polling (see fsevents.h). */
-    s->fsevents = cbm_fsevents_start(w, project_name, root_path);
     cbm_log_info("watcher.watch", "project", project_name, "path", root_path);
     return true;
 }
@@ -1185,21 +1199,25 @@ void cbm_watcher_unwatch(cbm_watcher_t *w, const char *project_name) {
         return;
     }
     bool removed = false;
+    cbm_fsevents_t *fe = NULL;
     cbm_mutex_lock(&w->projects_lock);
     project_state_t *s = cbm_ht_get(w->projects, project_name);
     if (s && defer_state_free(w, s)) {
         /* The entry leaves the table only once its state is safely on
-         * the deferred-free list; on OOM the watch stays registered. */
+         * the deferred-free list; on OOM the watch stays registered. Detach
+         * fsevents here, still under the lock — s is no longer safe to touch
+         * once released (a concurrent poll_once may free it immediately). */
         atomic_store_explicit(&s->registered, false, memory_order_release);
         if (s->active_git) {
             (void)cbm_subprocess_request_cancel(s->active_git);
         }
+        fe = state_detach_fsevents(s);
         cbm_ht_delete(w->projects, project_name);
         removed = true;
     }
     cbm_mutex_unlock(&w->projects_lock);
     if (removed) {
-        state_stop_fsevents(s);
+        cbm_fsevents_stop(fe);
         cbm_log_info("watcher.unwatch", "project", project_name);
     }
 }
@@ -1404,9 +1422,12 @@ static void prune_missing_project(cbm_watcher_t *w, project_state_t *s) {
         current->missing_root_count >= MISSING_ROOT_DELETE_AFTER && current->first_missing_ms > 0 &&
         now_ms - current->first_missing_ms >= (uint64_t)prune_grace_s() * CBM_MSEC_PER_SEC &&
         root_status(root_path, &stat_errno) == ROOT_MISSING;
+    cbm_fsevents_t *fe = NULL;
     if (still_eligible && defer_state_free(w, s)) {
         if (delete_cached_project_db(project_name)) {
             atomic_store_explicit(&s->registered, false, memory_order_release);
+            /* Detach under the lock — s is unsafe to touch once released. */
+            fe = state_detach_fsevents(s);
             cbm_ht_delete(w->projects, project_name);
             removed = true;
         } else {
@@ -1417,7 +1438,7 @@ static void prune_missing_project(cbm_watcher_t *w, project_state_t *s) {
     }
     cbm_mutex_unlock(&w->projects_lock);
     if (removed) {
-        state_stop_fsevents(s);
+        cbm_fsevents_stop(fe);
     }
 
     if (removed && w->project_pruned) {
