@@ -371,7 +371,7 @@ UNIXCODER_BLOB_SRC = vendored/nomic/code_vectors_blob.S
 TRACES_SRCS = src/traces/traces.c
 
 # Watcher module (new)
-WATCHER_SRCS = src/watcher/watcher.c
+WATCHER_SRCS = src/watcher/watcher.c src/watcher/fsevents.c
 
 # Git context module (new)
 GIT_SRCS = src/git/git_context.c
