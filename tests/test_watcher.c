@@ -2583,6 +2583,69 @@ TEST(watcher_touch_resets_immediate) {
     PASS();
 }
 
+TEST(watcher_fsevents_wakes_poll_without_touch) {
+    /* Linux-only: inotify activity alone (no explicit cbm_watcher_touch)
+     * must reset next_poll_ns so an immediately-following poll detects a
+     * change that the adaptive interval would otherwise have delayed.
+     * fsevents.c must never call index_fn itself — this proves the wake-up
+     * still goes through the ordinary git status/signature poll path: the
+     * first poll (before the fsevents debounce window elapses) must NOT
+     * see the change, only a poll issued after it. */
+#if defined(__linux__)
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_fse_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n");
+    }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_watch(w, "fse-repo", tmpdir);
+    index_call_count = 0;
+
+    /* Baseline */
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 0);
+
+    /* Dirty the tree via a plain filesystem write — no cbm_watcher_touch. */
+    {
+        char p[1024];
+        snprintf(p, sizeof(p), "%s/file.txt", tmpdir);
+        th_append_file(p, "dirty\n");
+    }
+
+    /* Immediately after the write, the fsevents debounce window has not
+     * elapsed yet, so next_poll_ns has not been reset — this poll must be
+     * blocked by the adaptive interval exactly as it is without fsevents. */
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 0);
+
+    /* Give the fsevents thread's quiet-period debounce time to fire the
+     * touch (FSEVENTS_DEBOUNCE_MS in fsevents.c, plus scheduling slack). */
+    cbm_usleep(600 * 1000);
+
+    /* Now the poll should proceed immediately, without ever calling
+     * cbm_watcher_touch by hand. */
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+#endif
+    PASS();
+}
+
 TEST(watcher_modify_tracked_file) {
     /* Port of TestWatcherTriggersOnChange / TestWatcherGitDetectsEdit:
      * Modify tracked file content (not just create/delete) → detected.
@@ -3202,6 +3265,7 @@ SUITE(watcher) {
     RUN_TEST(watcher_fallback_still_detects);
     RUN_TEST(watcher_poll_only_watched_projects);
     RUN_TEST(watcher_touch_resets_immediate);
+    RUN_TEST(watcher_fsevents_wakes_poll_without_touch);
     RUN_TEST(watcher_modify_tracked_file);
 
     /* Resource management & auto-indexing behavior */
