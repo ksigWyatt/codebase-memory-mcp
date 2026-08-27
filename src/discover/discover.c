@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h> // strdup
 #include <sys/stat.h>
+#include <time.h>
 
 int cbm_gitignore_match_result(const cbm_gitignore_t *gi, const char *rel_path, bool is_dir);
 
@@ -337,8 +338,34 @@ static bool resolve_global_excludes_path(char *out, size_t out_sz) {
 
 /* ── Public filter functions ─────────────────────── */
 
+/* .worktrees / .claude-worktrees specifically — the two ALWAYS_SKIP_DIRS
+ * entries that opt-in worktree indexing (issue #2 ask 1) may un-skip. This is
+ * a SEPARATE mechanism from the .cbmignore-negation safety core in
+ * is_safety_core_dir(): .git and node_modules stay non-negatable regardless of
+ * this flag. */
+static bool is_worktree_dir(const char *name) {
+    static const char *const WORKTREE_DIRS[] = {".worktrees", ".claude-worktrees", NULL};
+    return str_in_list(name, WORKTREE_DIRS);
+}
+
+/* Hard cap on how many individual worktree checkouts a single opted-in walk
+ * will descend into. Each worktree is effectively a full copy of the
+ * repository's tree, so an unbounded count multiplies discovery cost (and,
+ * until worktrees get their own project graphs, the SAME symbols) once per
+ * worktree. Beyond the cap, worktrees are reported as excluded subtrees
+ * (#411's existing mechanism) rather than silently dropped. */
+#define WORKTREE_INDEX_CAP 25
+
 bool cbm_should_skip_dir(const char *dirname, cbm_index_mode_t mode) {
+    return cbm_should_skip_dir_ex(dirname, mode, false);
+}
+
+bool cbm_should_skip_dir_ex(const char *dirname, cbm_index_mode_t mode, bool index_worktrees) {
     if (!dirname) {
+        return false;
+    }
+
+    if (index_worktrees && is_worktree_dir(dirname)) {
         return false;
     }
 
@@ -605,7 +632,8 @@ static bool should_skip_directory(const char *entry_name, const char *rel_path,
                                   const cbm_gitignore_t *global_gi,
                                   const cbm_gitignore_t *cbmignore, const cbm_gitignore_t *local_gi,
                                   const char *local_gi_prefix) {
-    if (cbm_should_skip_dir(entry_name, opts ? opts->mode : CBM_MODE_FULL)) {
+    if (cbm_should_skip_dir_ex(entry_name, opts ? opts->mode : CBM_MODE_FULL,
+                               opts && opts->index_worktrees)) {
         /* #500: a .cbmignore negation (e.g. "!obj/") whose rule is the last
          * match for this dir un-skips a built-in skip-list dir — except the
          * non-negatable safety core. Fall through so .gitignore/global/local
@@ -805,6 +833,13 @@ typedef struct {
     char prefix[CBM_SZ_4K];
     cbm_gitignore_t *local_gi;       /* nested .gitignore for this subtree */
     char local_gi_prefix[CBM_SZ_4K]; /* rel_prefix when local_gi was loaded */
+    /* True only for a frame that IS a .worktrees/.claude-worktrees directory
+     * itself (opted in via index_worktrees) — never for its children. Such a
+     * frame is popped through walk_dir_admit_worktrees() instead of the
+     * ordinary per-entry loop, so its immediate subdirectories can be ranked
+     * by mtime and capped at WORKTREE_INDEX_CAP before any of them are
+     * pushed as ordinary walk frames. */
+    bool worktree_container;
 } walk_frame_t;
 /* Initial capacity only — the stack grows on demand. A single directory can
  * hold more pending sibling frames than any fixed cap (dotnet/runtime has 855
@@ -836,7 +871,8 @@ static cbm_gitignore_t *try_load_nested_gitignore(const walk_frame_t *frame) {
  * context. Grows the stack geometrically; the caller's `parent` must not
  * point into the stack array (walk_dir pops into a local copy). */
 static void walk_push_subdir(walk_stack_t *ws, const char *abs_path, const char *rel_path,
-                             const walk_frame_t *parent, file_list_t *out) {
+                             const walk_frame_t *parent, file_list_t *out,
+                             bool worktree_container) {
     if (ws->top >= ws->cap) {
         int new_cap = ws->cap * 2;
         walk_frame_t *grown = realloc(ws->frames, (size_t)new_cap * sizeof(*grown));
@@ -862,6 +898,7 @@ static void walk_push_subdir(walk_stack_t *ws, const char *abs_path, const char 
         out->failed = true;
         return;
     }
+    slot->worktree_container = worktree_container;
     ws->top++;
 }
 
@@ -898,7 +935,9 @@ static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
         if (!dir_is_cache_tree(abs_path) &&
             !should_skip_directory(entry->name, rel_path, opts, gitignore, global_gi, cbmignore,
                                    frame->local_gi, frame->local_gi_prefix)) {
-            walk_push_subdir(ws, abs_path, rel_path, frame, out);
+            bool worktree_container =
+                opts && opts->index_worktrees && is_worktree_dir(entry->name);
+            walk_push_subdir(ws, abs_path, rel_path, frame, out, worktree_container);
         } else {
             /* Record the excluded subtree root so callers can report it (#411). */
             file_list_add_excluded(out, rel_path);
@@ -907,6 +946,123 @@ static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
         walk_dir_process_file(abs_path, rel_path, entry->name, opts, gitignore, global_gi,
                               cbmignore, frame->local_gi, frame->local_gi_prefix, st.st_size, out);
     }
+}
+
+typedef struct {
+    char abs_path[CBM_SZ_4K];
+    char rel_path[CBM_SZ_4K];
+    time_t mtime;
+} worktree_candidate_t;
+
+static int worktree_candidate_cmp_mtime_desc(const void *a, const void *b) {
+    const worktree_candidate_t *ca = a;
+    const worktree_candidate_t *cb = b;
+    if (ca->mtime > cb->mtime) {
+        return -1;
+    }
+    if (ca->mtime < cb->mtime) {
+        return 1;
+    }
+    return strcmp(ca->rel_path, cb->rel_path); /* stable, deterministic tie-break */
+}
+
+/* Special handling for a frame that IS a .worktrees/.claude-worktrees
+ * directory (opted in via index_worktrees): rank its immediate subdirectories
+ * (each one a git worktree checkout) by mtime and admit only the
+ * WORKTREE_INDEX_CAP most-recently-modified ones as ordinary walk frames. The
+ * rest are reported the same way any other excluded subtree is (#411) rather
+ * than silently dropped — a stale worktree loses the budget to a fresher one,
+ * but the loss is always visible in the "excluded" list. Plain files directly
+ * inside the container (unusual, but not disallowed) are processed normally
+ * and never count against the cap. */
+static void walk_dir_admit_worktrees(const walk_frame_t *frame, const cbm_discover_opts_t *opts,
+                                     const cbm_gitignore_t *gitignore,
+                                     const cbm_gitignore_t *global_gi,
+                                     const cbm_gitignore_t *cbmignore, walk_stack_t *ws,
+                                     file_list_t *out) {
+    cbm_dir_t *d = cbm_opendir(frame->dir);
+    if (!d) {
+        if (out->count_only) {
+            out->failed = true;
+        }
+        return;
+    }
+
+    worktree_candidate_t *candidates = NULL;
+    int candidate_count = 0;
+    int candidate_cap = 0;
+
+    cbm_dirent_t *entry;
+    while (!file_list_should_stop(out) && (entry = cbm_readdir(d)) != NULL) {
+        char abs_path[CBM_SZ_4K];
+        char rel_path[CBM_SZ_4K];
+        int absolute_length = snprintf(abs_path, sizeof(abs_path), "%s/%s", frame->dir, entry->name);
+        int relative_length = frame->prefix[0] != '\0'
+                                  ? snprintf(rel_path, sizeof(rel_path), "%s/%s", frame->prefix,
+                                             entry->name)
+                                  : snprintf(rel_path, sizeof(rel_path), "%s", entry->name);
+        if (absolute_length <= 0 || (size_t)absolute_length >= sizeof(abs_path) ||
+            relative_length <= 0 || (size_t)relative_length >= sizeof(rel_path)) {
+            out->failed = true;
+            continue;
+        }
+
+        struct stat st;
+        if (safe_stat(abs_path, &st) != 0) {
+            continue;
+        }
+        if (!S_ISDIR(st.st_mode)) {
+            if (S_ISREG(st.st_mode)) {
+                walk_dir_process_file(abs_path, rel_path, entry->name, opts, gitignore, global_gi,
+                                      cbmignore, frame->local_gi, frame->local_gi_prefix,
+                                      st.st_size, out);
+            }
+            continue;
+        }
+        if (dir_is_cache_tree(abs_path) ||
+            should_skip_directory(entry->name, rel_path, opts, gitignore, global_gi, cbmignore,
+                                  frame->local_gi, frame->local_gi_prefix)) {
+            file_list_add_excluded(out, rel_path);
+            continue;
+        }
+
+        if (candidate_count >= candidate_cap) {
+            int new_cap = candidate_cap ? candidate_cap * 2 : CBM_SZ_64;
+            worktree_candidate_t *grown = realloc(candidates, (size_t)new_cap * sizeof(*grown));
+            if (!grown) {
+                out->failed = true;
+                free(candidates);
+                cbm_closedir(d);
+                return;
+            }
+            candidates = grown;
+            candidate_cap = new_cap;
+        }
+        worktree_candidate_t *c = &candidates[candidate_count];
+        int abs_length = snprintf(c->abs_path, sizeof(c->abs_path), "%s", abs_path);
+        int rel_length = snprintf(c->rel_path, sizeof(c->rel_path), "%s", rel_path);
+        if (abs_length <= 0 || (size_t)abs_length >= sizeof(c->abs_path) || rel_length <= 0 ||
+            (size_t)rel_length >= sizeof(c->rel_path)) {
+            out->failed = true;
+            continue;
+        }
+        c->mtime = st.st_mtime;
+        candidate_count++;
+    }
+    cbm_closedir(d);
+
+    if (candidate_count > 1) {
+        qsort(candidates, (size_t)candidate_count, sizeof(*candidates),
+             worktree_candidate_cmp_mtime_desc);
+    }
+    int admitted = candidate_count < WORKTREE_INDEX_CAP ? candidate_count : WORKTREE_INDEX_CAP;
+    for (int i = 0; i < admitted; i++) {
+        walk_push_subdir(ws, candidates[i].abs_path, candidates[i].rel_path, frame, out, false);
+    }
+    for (int i = admitted; i < candidate_count; i++) {
+        file_list_add_excluded(out, candidates[i].rel_path);
+    }
+    free(candidates);
 }
 
 static bool walk_owned_gitignore_append(cbm_gitignore_t ***owned, size_t *count, size_t *capacity,
@@ -970,6 +1126,11 @@ static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_dis
                 break;
             }
             frame.local_gi = loaded;
+        }
+
+        if (frame.worktree_container) {
+            walk_dir_admit_worktrees(&frame, opts, gitignore, global_gi, cbmignore, &ws, out);
+            continue;
         }
 
         cbm_dir_t *d = cbm_opendir(frame.dir);

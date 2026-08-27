@@ -53,6 +53,14 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path, cbm
  * When enabled, the pipeline writes a compressed artifact after indexing. */
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);
 
+/* Opt-in (default false — issue #2 ask 1): index .worktrees/.claude-worktrees
+ * directories instead of hard-skipping them during discovery. .git and
+ * node_modules remain a separate, unconditional safety core regardless of
+ * this flag. Content discovered this way lands in the SAME project graph as
+ * the main checkout — branch-scoped, one-project-per-worktree indexing is a
+ * separate, not-yet-implemented follow-up. */
+void cbm_pipeline_set_index_worktrees(cbm_pipeline_t *p, bool enabled);
+
 /* Free a pipeline and all its internal state. NULL-safe. */
 void cbm_pipeline_free(cbm_pipeline_t *p);
 

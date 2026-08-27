@@ -6,7 +6,14 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include "discover/discover.h"
+#include "foundation/compat.h"
+#include "foundation/constants.h"
 #include "foundation/platform.h"
+#ifdef _WIN32
+#include <sys/utime.h>
+#else
+#include <utime.h>
+#endif
 
 typedef struct {
     char *home;
@@ -1190,6 +1197,238 @@ TEST(discover_cbmignore_negation_cannot_unskip_safety_core) {
     PASS();
 }
 
+/* ── opt-in worktree indexing (issue #2 ask 1) ──────────────────── */
+
+/* Default behavior is unchanged: with index_worktrees left false (the
+ * zero-value default), .worktrees/.claude-worktrees stay hard-skipped exactly
+ * as before this option existed. */
+TEST(discover_worktrees_skipped_by_default) {
+    char *base = th_mktempdir("cbm_disc_wt_default");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "main.go"), "package main\n");
+    th_write_file(TH_PATH(base, ".worktrees/feature/app.go"), "package app\n");
+    th_write_file(TH_PATH(base, ".claude-worktrees/feature/app.go"), "package app\n");
+
+    cbm_discover_opts_t opts = {0};
+    ASSERT_FALSE(opts.index_worktrees);
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "main.go"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, ".worktrees/feature/app.go"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, ".claude-worktrees/feature/app.go"));
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* Opt-in: index_worktrees = true un-skips BOTH .worktrees and
+ * .claude-worktrees without needing any .cbmignore negation. */
+TEST(discover_worktrees_indexed_when_opted_in) {
+    char *base = th_mktempdir("cbm_disc_wt_optin");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "main.go"), "package main\n");
+    th_write_file(TH_PATH(base, ".worktrees/feature/app.go"), "package app\n");
+    th_write_file(TH_PATH(base, ".claude-worktrees/other/app.go"), "package app\n");
+
+    cbm_discover_opts_t opts = {.index_worktrees = true};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(count, 3);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "main.go"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, ".worktrees/feature/app.go"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, ".claude-worktrees/other/app.go"));
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* index_worktrees does NOT bypass an actual .gitignore inside the walked
+ * tree — it only lifts the hardcoded ALWAYS_SKIP_DIRS entry. A file that is
+ * separately gitignored inside the worktree stays excluded. */
+TEST(discover_worktrees_optin_still_honors_gitignore) {
+    char *base = th_mktempdir("cbm_disc_wt_gitignore");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, ".gitignore"), ".worktrees/feature/generated.go\n");
+    th_write_file(TH_PATH(base, "main.go"), "package main\n");
+    th_write_file(TH_PATH(base, ".worktrees/feature/app.go"), "package app\n");
+    th_write_file(TH_PATH(base, ".worktrees/feature/generated.go"), "package app\n");
+
+    cbm_discover_opts_t opts = {.index_worktrees = true};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(count, 2);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "main.go"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, ".worktrees/feature/app.go"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, ".worktrees/feature/generated.go"));
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* index_worktrees must NEVER affect the .git/node_modules safety core — it is
+ * a completely separate mechanism from is_safety_core_dir()'s .cbmignore
+ * negation guard. Regression guard for issue #802. */
+TEST(discover_worktrees_optin_does_not_unskip_git_or_node_modules) {
+    char *base = th_mktempdir("cbm_disc_wt_safety");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "main.go"), "package main\n");
+    th_write_file(TH_PATH(base, ".git/hooks/hook.go"), "package hooks\n");
+    th_write_file(TH_PATH(base, "node_modules/pkg/index.js"), "module.exports = 1;\n");
+    th_write_file(TH_PATH(base, ".worktrees/feature/app.go"), "package app\n");
+
+    cbm_discover_opts_t opts = {.index_worktrees = true};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(count, 2);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "main.go"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, ".worktrees/feature/app.go"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, ".git/hooks/hook.go"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "node_modules/pkg/index.js"));
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* cbm_should_skip_dir_ex is the direct unit surface for the flag, independent
+ * of a full directory walk. */
+TEST(discover_should_skip_dir_ex_worktree_flag) {
+    ASSERT_TRUE(cbm_should_skip_dir_ex(".worktrees", CBM_MODE_FULL, false));
+    ASSERT_TRUE(cbm_should_skip_dir_ex(".claude-worktrees", CBM_MODE_FULL, false));
+    ASSERT_FALSE(cbm_should_skip_dir_ex(".worktrees", CBM_MODE_FULL, true));
+    ASSERT_FALSE(cbm_should_skip_dir_ex(".claude-worktrees", CBM_MODE_FULL, true));
+    /* Unaffected by the flag either way. */
+    ASSERT_TRUE(cbm_should_skip_dir_ex(".git", CBM_MODE_FULL, true));
+    ASSERT_TRUE(cbm_should_skip_dir_ex("node_modules", CBM_MODE_FULL, true));
+    ASSERT_FALSE(cbm_should_skip_dir_ex("src", CBM_MODE_FULL, true));
+    /* cbm_should_skip_dir() stays equivalent to index_worktrees=false. */
+    ASSERT_EQ(cbm_should_skip_dir(".worktrees", CBM_MODE_FULL),
+             cbm_should_skip_dir_ex(".worktrees", CBM_MODE_FULL, false));
+    PASS();
+}
+
+/* Directory mtime only changes when its own entries are added/removed/
+ * renamed — NOT when a file already inside it is merely rewritten. Ranking
+ * relies on the worktree directory's own mtime, so the test sets it directly
+ * and deterministically with utime() rather than relying on wall-clock sleeps
+ * and content rewrites (which would not move the ranking at all). */
+static bool th_set_dir_mtime(const char *path, time_t when) {
+#ifdef _WIN32
+    struct __utimbuf64 times = {.actime = when, .modtime = when};
+    return _utime64(path, &times) == 0;
+#else
+    struct utimbuf times = {.actime = when, .modtime = when};
+    return utime(path, &times) == 0;
+#endif
+}
+
+/* Cap on how many worktree checkouts a single opted-in walk descends into
+ * (issue #2 ask 1 follow-up): only the WORKTREE_INDEX_CAP (25) most-recently
+ * modified worktrees are indexed; the rest are reported as excluded subtrees
+ * (#411's existing mechanism) so the drop is always visible, never silent. */
+TEST(discover_worktrees_cap_admits_most_recently_modified) {
+    char *base = th_mktempdir("cbm_disc_wt_cap");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "main.go"), "package main\n");
+    /* 27 worktrees: only 25 fit the cap. Give each an explicit, strictly
+     * increasing directory mtime so wt00 is oldest and wt26 is newest, then
+     * set wt00/wt01 (created first, so otherwise the two oldest) to be the
+     * two NEWEST — they must still be admitted despite being created first,
+     * which is exactly the case directory/creation order would get wrong. */
+    char path[CBM_SZ_1K];
+    char dirpath[CBM_SZ_1K];
+    time_t base_time = time(NULL) - 1000;
+    for (int i = 0; i < 27; i++) {
+        snprintf(path, sizeof(path), ".worktrees/wt%02d/app.go", i);
+        th_write_file(TH_PATH(base, path), "package app\n");
+        snprintf(dirpath, sizeof(dirpath), ".worktrees/wt%02d", i);
+        ASSERT_TRUE(th_set_dir_mtime(TH_PATH(base, dirpath), base_time + i));
+    }
+    ASSERT_TRUE(th_set_dir_mtime(TH_PATH(base, ".worktrees/wt00"), base_time + 1000));
+    ASSERT_TRUE(th_set_dir_mtime(TH_PATH(base, ".worktrees/wt01"), base_time + 1001));
+
+    cbm_discover_opts_t opts = {.index_worktrees = true};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    char **excluded = NULL;
+    int excluded_count = 0;
+
+    int rc = cbm_discover_ex(base, &opts, &files, &count, &excluded, &excluded_count);
+    ASSERT_EQ(rc, 0);
+    /* main.go + 25 admitted worktrees' app.go. */
+    ASSERT_EQ(count, 26);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "main.go"));
+    /* Re-touched (now-newest) worktrees must be admitted... */
+    ASSERT_TRUE(discover_has_rel_path(files, count, ".worktrees/wt00/app.go"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, ".worktrees/wt01/app.go"));
+    /* ...displacing the two now-least-recently-modified (wt02, wt03), which
+     * must be excluded, loudly, rather than silently dropped. */
+    ASSERT_FALSE(discover_has_rel_path(files, count, ".worktrees/wt02/app.go"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, ".worktrees/wt03/app.go"));
+    ASSERT_TRUE(discover_excluded_contains(excluded, excluded_count, ".worktrees/wt02"));
+    ASSERT_TRUE(discover_excluded_contains(excluded, excluded_count, ".worktrees/wt03"));
+
+    cbm_discover_free_excluded(excluded, excluded_count);
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* Fewer worktrees than the cap: all are admitted, none excluded. */
+TEST(discover_worktrees_under_cap_admits_all) {
+    char *base = th_mktempdir("cbm_disc_wt_undercap");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "main.go"), "package main\n");
+    for (int i = 0; i < 3; i++) {
+        char path[CBM_SZ_1K];
+        snprintf(path, sizeof(path), ".worktrees/wt%d/app.go", i);
+        th_write_file(TH_PATH(base, path), "package app\n");
+    }
+
+    cbm_discover_opts_t opts = {.index_worktrees = true};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    char **excluded = NULL;
+    int excluded_count = 0;
+
+    int rc = cbm_discover_ex(base, &opts, &files, &count, &excluded, &excluded_count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(count, 4);
+    for (int i = 0; i < 3; i++) {
+        char path[CBM_SZ_1K];
+        snprintf(path, sizeof(path), ".worktrees/wt%d/app.go", i);
+        ASSERT_TRUE(discover_has_rel_path(files, count, path));
+    }
+    ASSERT_EQ(excluded_count, 0);
+
+    cbm_discover_free_excluded(excluded, excluded_count);
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
 /* ── .git/info/exclude tests (issue #489) ─────────────────────── */
 
 /* Per-clone excludes written to .git/info/exclude (not committed) must be
@@ -1797,6 +2036,15 @@ SUITE(discover) {
     RUN_TEST(discover_cbmignore_negates_fast_skip_dir);
     RUN_TEST(discover_cbmignore_negation_last_match_wins);
     RUN_TEST(discover_cbmignore_negation_cannot_unskip_safety_core);
+
+    /* Opt-in worktree indexing (issue #2 ask 1) */
+    RUN_TEST(discover_worktrees_skipped_by_default);
+    RUN_TEST(discover_worktrees_indexed_when_opted_in);
+    RUN_TEST(discover_worktrees_optin_still_honors_gitignore);
+    RUN_TEST(discover_worktrees_optin_does_not_unskip_git_or_node_modules);
+    RUN_TEST(discover_should_skip_dir_ex_worktree_flag);
+    RUN_TEST(discover_worktrees_cap_admits_most_recently_modified);
+    RUN_TEST(discover_worktrees_under_cap_admits_all);
 
     /* .git/info/exclude support (issue #489) */
     RUN_TEST(discover_git_info_exclude);

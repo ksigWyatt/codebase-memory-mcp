@@ -156,6 +156,10 @@ struct cbm_pipeline {
     atomic_int cancelled_storage;
     atomic_int *cancelled;
     bool persistence; /* write .codebase-memory/graph.db.zst after indexing */
+    /* Opt-in (config: index_worktrees, default false — issue #2 ask 1): index
+     * .worktrees/.claude-worktrees instead of hard-skipping them. Set via
+     * cbm_pipeline_set_index_worktrees before cbm_pipeline_run. */
+    bool index_worktrees;
 
     /* Indexing state (set during run) */
     cbm_gbuf_t *gbuf;
@@ -272,6 +276,7 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->requested_mode = mode;
     p->mode = mode;
     p->persistence = false;
+    p->index_worktrees = false;
     p->committed_nodes = -1;
     p->committed_edges = -1;
     atomic_init(&p->cancelled_storage, 0);
@@ -301,6 +306,12 @@ static int pipeline_refresh_git_context(cbm_pipeline_t *p) {
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled) {
     if (p) {
         p->persistence = enabled;
+    }
+}
+
+void cbm_pipeline_set_index_worktrees(cbm_pipeline_t *p, bool enabled) {
+    if (p) {
+        p->index_worktrees = enabled;
     }
 }
 
@@ -2182,6 +2193,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
         .mode = p->requested_mode,
         .ignore_file = NULL,
         .max_file_size = 0,
+        .index_worktrees = p->index_worktrees,
     };
     cbm_file_info_t *files = NULL;
     int file_count = 0;

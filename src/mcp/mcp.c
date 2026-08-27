@@ -404,7 +404,12 @@ static const tool_def_t TOOLS[] = {
      "are normalized.\"},"
      "\"persistence\":{\"type\":\"boolean\",\"default\":false,\"description\":"
      "\"Write compressed artifact to .codebase-memory/graph.db.zst for team sharing. "
-     "Teammates can bootstrap from the artifact instead of full re-indexing.\"}"
+     "Teammates can bootstrap from the artifact instead of full re-indexing.\"},"
+     "\"index_worktrees\":{\"type\":\"boolean\",\"default\":false,\"description\":"
+     "\"Index .worktrees/.claude-worktrees directories instead of skipping them (default: "
+     "config key index_worktrees). Each worktree still lands in THIS SAME project graph, "
+     "not a separate one per branch. Capped at 25 worktrees, most-recently-modified first; "
+     "the rest are reported under 'excluded'.\"}"
      "},\"required\":[\"repo_path\"]}"},
 
     {"search_graph", "Search graph",
@@ -8260,6 +8265,10 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     free(mode_str);
 
     bool persistence = cbm_mcp_get_bool_arg(args, "persistence");
+    /* Opt-in (issue #2 ask 1): explicit per-call arg, falling back to the
+     * index_worktrees config default for callers that don't pass it. */
+    bool index_worktrees = cbm_mcp_get_bool_arg(args, "index_worktrees") ||
+                           cbm_config_get_bool(srv->config, CBM_CONFIG_INDEX_WORKTREES, false);
 
     cbm_pipeline_t *p = cbm_pipeline_new(repo_path, NULL, mode);
     if (!p) {
@@ -8279,6 +8288,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     }
     free(name_override);
     cbm_pipeline_set_persistence(p, persistence);
+    cbm_pipeline_set_index_worktrees(p, index_worktrees);
 
     char *project_name = heap_strdup(cbm_pipeline_project_name(p));
 
