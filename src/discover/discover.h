@@ -109,8 +109,15 @@ typedef enum {
 #endif
 
 /* Check if a directory name should always be skipped (e.g. .git, node_modules).
- * Only checks the basename, not the full path. */
+ * Only checks the basename, not the full path. Equivalent to
+ * cbm_should_skip_dir_ex(dirname, mode, false). */
 bool cbm_should_skip_dir(const char *dirname, cbm_index_mode_t mode);
+
+/* Like cbm_should_skip_dir(), but when index_worktrees is true, .worktrees and
+ * .claude-worktrees are not hard-skipped (issue #2 ask 1, opt-in via the
+ * index_worktrees config key, default false). .git and node_modules are a
+ * separate, unconditional safety core and are never affected by this flag. */
+bool cbm_should_skip_dir_ex(const char *dirname, cbm_index_mode_t mode, bool index_worktrees);
 
 /* Check if a file has a suffix that should be skipped (e.g. .pyc, .png). */
 bool cbm_has_ignored_suffix(const char *filename, cbm_index_mode_t mode);
@@ -134,6 +141,14 @@ typedef struct {
     cbm_index_mode_t mode;   /* CBM_MODE_FULL or CBM_MODE_FAST */
     const char *ignore_file; /* path to .cbmignore file, or NULL */
     int64_t max_file_size;   /* 0 = no limit */
+    /* Opt-in (config: index_worktrees, default false): index .worktrees/
+     * .claude-worktrees directories instead of hard-skipping them. .git and
+     * node_modules are a SEPARATE, unconditional safety core and are never
+     * affected by this flag — see is_safety_core_dir() in discover.c. Content
+     * discovered this way still lands in the SAME project graph as the main
+     * checkout (issue #802's original concern); branch-scoped, one-project-
+     * per-worktree indexing is tracked separately. */
+    bool index_worktrees;
 } cbm_discover_opts_t;
 
 typedef enum {
